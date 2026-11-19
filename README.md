@@ -8,7 +8,8 @@ OneBot，不依赖 OpenClaw。
 pull 收件箱 + systemd 常驻 + keepalive + hook 轮询，处理前先读最近 40 条上下文。
 
 > 状态：2026-11-19 已在沙箱模式下端到端验证通过 —— token、网关、READY、
-> 两轮 C2C 私聊（“你好” / “收到”）均已回复并确认。当前版本 v0.1.0。
+> 两轮 C2C 私聊（“你好” / “收到”）均已回复并确认。当前版本 v0.3.0
+> （v0.2.0 直接发图片/视频；v0.3.0 收图：入站图片下载到本地）。
 
 ## 目录结构
 
@@ -40,6 +41,12 @@ QQ 用户私聊 → QQ 官方网关 (wss) → qq-bot 守护进程 → SQLite 收
 
 - **收到消息**：守护进程连 QQ 网关 WebSocket，`C2C_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE`
   事件按 `d.id` 去重后写入 SQLite（`~/.local/state/qq-bot/qq-bot.db`）。
+- **收图（v0.3.0）**：消息里的 `d.attachments` 不再丢弃。守护进程收到带附件的事件后
+  立刻把图片下载到 `~/.local/state/qq-bot/media/`（文件名 `<event_id>-<序号>-<原文件名>`），
+  因为 QQ CDN 链接很快就过期，只存链接不可靠。下载失败不影响事件入队（记日志、留原链接）。
+  事件里带上附件（含本地路径），`inbox pull` 能直接看到；chatlog 里图片记为
+  `[图片] <本地路径>`，文字+图片一起处理。纯文字消息的行为完全不变。
+  附件字段形状见 DESIGN.md §3（`content_type` / `filename` / `height` / `width` / `size` / `url`）。
 - **拉取**：`qq-bot inbox pull --lease 30m` 领走事件，30 分钟内未 ack 会重新出现。
 - **回复**：`qq-bot send --to <openid> --kind c2c --msg-id <d.id> --text -`，
   只发纯文本。被动回复窗口：私聊 60 分钟、每条消息最多 5 次；群 5 分钟。

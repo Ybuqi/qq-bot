@@ -21,9 +21,9 @@ import { DatabaseSync } from "node:sqlite";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
-import { join, dirname, extname } from "node:path";
+import { join, dirname, extname, basename } from "node:path";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 /* ------------------------------------------------------------------ */
 /* Paths / config / env                                                */
@@ -137,6 +137,8 @@ export interface QQEvent {
   status: string; // pending | leased | acked | dead
   lease_until: number | null;
   reply_count: number;
+  /** Inbound attachments, parsed from the events.attachments JSON column. */
+  attachments?: QQAttachment[];
 }
 
 export class Store {
@@ -145,6 +147,10 @@ export class Store {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode=WAL;");
+    // 2026-11-19: a health/chatlog read collided with the daemon's write
+    // ("database is locked"). Wait up to 5s for the lock instead of
+    // failing at once; no other concurrency change.
+    this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS events(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,7 +164,8 @@ export class Store {
         msg_seq_next INTEGER DEFAULT 1,
         status TEXT DEFAULT 'pending',
         lease_until INTEGER,
-        reply_count INTEGER DEFAULT 0
+        reply_count INTEGER DEFAULT 0,
+        attachments TEXT DEFAULT '[]'
       );
       CREATE TABLE IF NOT EXISTS chatlog(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,6 +182,12 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
       CREATE INDEX IF NOT EXISTS idx_chatlog_target ON chatlog(target_openid, ts);
     `);
+    // v0.3.0 migration: databases created before inbound attachments
+    // have no attachments column — add it without touching existing rows.
+    const cols = this.db.prepare("PRAGMA table_info(events)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "attachments")) {
+      this.db.exec("ALTER TABLE events ADD COLUMN attachments TEXT DEFAULT '[]';");
+    }
   }
 
   close() { this.db.close(); }
@@ -189,19 +202,27 @@ export class Store {
 
   /** Insert an inbound event; returns false if d.id was already seen. */
   insertEvent(e: Omit<QQEvent, "id" | "msg_seq_next" | "status" | "lease_until" | "reply_count">): boolean {
+    const atts = e.attachments ?? [];
     const r = this.db.prepare(
-      `INSERT OR IGNORE INTO events(event_id,kind,from_openid,target_openid,content,author_name,received_at)
-       VALUES(?,?,?,?,?,?,?)`
-    ).run(e.event_id, e.kind, e.from_openid, e.target_openid, e.content, e.author_name, e.received_at);
+      `INSERT OR IGNORE INTO events(event_id,kind,from_openid,target_openid,content,author_name,received_at,attachments)
+       VALUES(?,?,?,?,?,?,?,?)`
+    ).run(e.event_id, e.kind, e.from_openid, e.target_openid, e.content, e.author_name, e.received_at, JSON.stringify(atts));
     if (r.changes === 0) return false;
+    // Chatlog keeps the text; attachments are appended as markers so the
+    // agent reading context can see (and open) the received image/file.
+    // Pure-text events are unchanged: no attachments, no marker.
+    const chatContent = atts.length
+      ? [e.content, ...atts.map(attachmentChatlogMarker)].filter(Boolean).join(" ").trim()
+      : e.content;
     this.db.prepare(
       `INSERT INTO chatlog(kind,target_openid,from_openid,role,content,ts) VALUES(?,?,?,'user',?,?)`
-    ).run(e.kind, e.target_openid, e.from_openid, e.content, e.received_at);
+    ).run(e.kind, e.target_openid, e.from_openid, chatContent, e.received_at);
     return true;
   }
 
   getEvent(eventId: string): QQEvent | null {
-    return this.db.prepare("SELECT * FROM events WHERE event_id=?").get(eventId) as QQEvent | null;
+    const row = this.db.prepare("SELECT * FROM events WHERE event_id=?").get(eventId) as any;
+    return row ? parseEventRow(row) : null;
   }
 
   counts(): { pending: number; leased: number; acked: number; dead: number } {
@@ -219,12 +240,12 @@ export class Store {
     this.db.prepare("UPDATE events SET status='pending', lease_until=NULL WHERE status='leased' AND lease_until IS NOT NULL AND lease_until < ?").run(now);
     const rows = this.db.prepare(
       "SELECT * FROM events WHERE status='pending' ORDER BY received_at ASC LIMIT ?"
-    ).all(limit) as QQEvent[];
+    ).all(limit) as any[];
     const upd = this.db.prepare("UPDATE events SET status='leased', lease_until=? WHERE event_id=? AND status='pending'");
     const claimed: QQEvent[] = [];
     for (const row of rows) {
       const r = upd.run(until, row.event_id);
-      if (r.changes > 0) claimed.push({ ...row, status: "leased", lease_until: until });
+      if (r.changes > 0) claimed.push({ ...parseEventRow(row), status: "leased", lease_until: until });
     }
     return claimed;
   }
@@ -700,6 +721,145 @@ export function normalizeTimestamp(ts: unknown, fallback = Date.now()): number {
   return fallback;
 }
 
+/* ------------------------------------------------------------------ */
+/* Inbound attachments (v0.3.0) — receive images/files from QQ        */
+/* ------------------------------------------------------------------ */
+
+/** One inbound attachment, as delivered in d.attachments of
+ *  C2C_MESSAGE_CREATE / GROUP_AT_MESSAGE_CREATE.
+ *  Field shape per @tencent-connect/openclaw-qqbot src/types.ts
+ *  (MessageAttachment): content_type (e.g. "image/png"), filename,
+ *  height, width, size, url — plus QQ's optional voice_wav_url /
+ *  asr_refer_text for voice (not stored: voice is out of scope here).
+ *  The url is a QQ CDN link; treat it as short-lived — the daemon
+ *  downloads it immediately and `local_path` is the durable copy. */
+export interface QQAttachment {
+  url?: string;
+  content_type?: string;
+  filename?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  /** Local copy under state_dir/media/ (filled in by the daemon). */
+  local_path?: string;
+}
+
+/** Parse a raw events row: the attachments column is JSON text. */
+export function parseEventRow(row: any): QQEvent {
+  let atts: QQAttachment[] = [];
+  if (typeof row.attachments === "string" && row.attachments) {
+    try { atts = parseAttachments(JSON.parse(row.attachments)); } catch { atts = []; }
+  } else if (Array.isArray(row.attachments)) {
+    atts = parseAttachments(row.attachments);
+  }
+  return { ...row, attachments: atts };
+}
+
+/** Tolerant parse of d.attachments: keep only the fields we use,
+ *  drop entries that are not objects, coerce numbers only when finite.
+ *  Non-array / missing input yields []. */
+export function parseAttachments(raw: unknown): QQAttachment[] {
+  if (!Array.isArray(raw)) return [];
+  const out: QQAttachment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const a = item as Record<string, unknown>;
+    const att: QQAttachment = {};
+    if (typeof a.url === "string" && a.url) att.url = a.url;
+    if (typeof a.content_type === "string" && a.content_type) att.content_type = a.content_type;
+    if (typeof a.filename === "string" && a.filename) att.filename = a.filename;
+    for (const k of ["size", "width", "height"] as const) {
+      const n = typeof a[k] === "number" ? a[k] : Number(a[k]);
+      if (Number.isFinite(n)) att[k] = n;
+    }
+    if (typeof a.local_path === "string" && a.local_path) att.local_path = a.local_path;
+    if (att.url || att.filename) out.push(att);
+  }
+  return out;
+}
+
+/** Chatlog marker for one attachment: "[图片] <本地路径或 URL>".
+ *  Label follows the outbound media labels ([图片]/[视频]/[音频]/[文件]). */
+export function attachmentChatlogMarker(att: QQAttachment): string {
+  const ct = att.content_type ?? "";
+  const label = ct.startsWith("image/") ? "图片"
+    : ct.startsWith("video/") ? "视频"
+    : ct.startsWith("audio/") ? "音频" : "附件";
+  return `[${label}] ${att.local_path ?? att.url ?? att.filename ?? ""}`.trim();
+}
+
+/** Safe filename for the media dir: basename only, no path separators
+ *  or control chars; falls back to an extension from content_type. */
+export function sanitizeAttachmentFilename(name: string | undefined, contentType?: string): string {
+  let base = basename(String(name ?? "")).replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^\.+/, "");
+  if (!base || base === "." || base === "..") base = "file";
+  if (!extname(base) && contentType) {
+    const ext = contentType.split("/")[1]?.split(";")[0]?.trim();
+    if (ext && /^[A-Za-z0-9]+$/.test(ext)) base += `.${ext}`;
+  }
+  return base;
+}
+
+/** Max bytes to download for one inbound attachment (QQ images are
+ *  normally well under this; anything bigger is refused, not truncated). */
+export const MAX_INBOUND_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+/** Download one attachment to mediaDir, named
+ *  `<eventId>-<index>-<filename>`. Returns the absolute local path,
+ *  or null on any failure (caller logs it; the event still queues).
+ *  Uses plain fetch — same as the token/gateway requests, so the
+ *  proxy variables from the env file apply the same way. */
+export async function downloadAttachment(
+  mediaDir: string, eventId: string, index: number, att: QQAttachment,
+  log: (msg: string) => void = () => {},
+): Promise<string | null> {
+  if (!att.url || !/^https?:\/\//i.test(att.url)) return null;
+  const fileName = `${eventId}-${index}-${sanitizeAttachmentFilename(att.filename, att.content_type)}`;
+  const dest = join(mediaDir, fileName);
+  try {
+    mkdirSync(mediaDir, { recursive: true });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30_000);
+    let res: Response;
+    try {
+      res = await fetch(att.url, { signal: ctrl.signal, redirect: "follow" });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) { log(`attachment download failed: HTTP ${res.status} for ${att.url}`); return null; }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_INBOUND_ATTACHMENT_BYTES) {
+      log(`attachment too large (${buf.length} bytes), skipped: ${att.url}`);
+      return null;
+    }
+    writeFileSync(dest, buf);
+    return dest;
+  } catch (err: any) {
+    log(`attachment download failed: ${err?.message ?? err} for ${att.url}`);
+    return null;
+  }
+}
+
+/** Async dispatch for the daemon: downloads attachments first (QQ CDN
+ *  links expire quickly), then inserts the event with local_path set.
+ *  A download failure never blocks queueing — the event is inserted
+ *  with the original URL and a log line. */
+export async function handleDispatchAsync(
+  store: Store, config: QQConfig, t: string, d: any,
+  log: (msg: string) => void = () => {},
+): Promise<boolean> {
+  const atts = parseAttachments(d?.attachments);
+  if (atts.length === 0) return handleDispatch(store, t, d);
+  const mediaDir = join(expandHome(config.media_dir || "~/.local/state/qq-bot/media"));
+  const downloaded: QQAttachment[] = [];
+  for (let i = 0; i < atts.length; i++) {
+    const local = await downloadAttachment(mediaDir, String(d.id), i, atts[i], log);
+    downloaded.push(local ? { ...atts[i], local_path: local } : atts[i]);
+  }
+  const withLocal = { ...d, attachments: downloaded };
+  return handleDispatch(store, t, withLocal);
+}
+
 /** Handle one gateway Dispatch event; returns true if a message was queued. */
 export function handleDispatch(store: Store, t: string, d: any): boolean {
   if (t === "C2C_MESSAGE_CREATE" && d?.id && d?.author?.user_openid) {
@@ -710,6 +870,7 @@ export function handleDispatch(store: Store, t: string, d: any): boolean {
       content: String(d.content ?? ""),
       author_name: String(d.author.username ?? d.author.user_openid),
       received_at: normalizeTimestamp(d.timestamp),
+      attachments: parseAttachments(d.attachments),
     });
   }
   if (t === "GROUP_AT_MESSAGE_CREATE" && d?.id && d?.group_openid && d?.author?.member_openid) {
@@ -720,6 +881,7 @@ export function handleDispatch(store: Store, t: string, d: any): boolean {
       content: stripAtMention(String(d.content ?? "")),
       author_name: String(d.author.username ?? d.author.member_openid),
       received_at: normalizeTimestamp(d.timestamp),
+      attachments: parseAttachments(d.attachments),
     });
   }
   return false;
@@ -882,8 +1044,13 @@ export function connectOnce(opts: ConnectOpts): Promise<string> {
           opts.onStateChanged?.();
           opts.log("RESUMED");
         } else if (t === "C2C_MESSAGE_CREATE" || t === "GROUP_AT_MESSAGE_CREATE") {
-          const queued = handleDispatch(store, t, d);
-          opts.log(`${t} ${d?.id} ${queued ? "queued" : "duplicate"}`);
+          // Downloads run async (QQ CDN links expire fast); a failure
+          // only logs — handleDispatchAsync still queues the event.
+          void handleDispatchAsync(store, config, t, d, opts.log).then((queued) => {
+            opts.log(`${t} ${d?.id} ${queued ? "queued" : "duplicate"}`);
+          }).catch((err: any) => {
+            opts.log(`${t} ${d?.id} dispatch failed: ${err?.message ?? err}`);
+          });
         }
       } else if (op === 7) { // Reconnect (Discord-style; treat as close)
         finish("reconnect-requested");
@@ -1054,6 +1221,7 @@ async function main() {
         event_id: e.event_id, kind: e.kind, from_openid: e.from_openid,
         target_openid: e.target_openid, content: e.content, msg_id: e.event_id,
         author_name: e.author_name, received_at: e.received_at,
+        attachments: e.attachments ?? [],
         context: store.contextFor(e.target_openid, 40),
       }));
       console.log(JSON.stringify({ events }, null, 2));

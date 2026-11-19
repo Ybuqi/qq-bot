@@ -1,3 +1,4 @@
+import { DatabaseSync } from "node:sqlite";
 import { describe, test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -9,7 +10,9 @@ import {
   INTENT_LEVELS, nextIntentLevel, handleDispatch, parseFlags, splitGlobalArgs,
   claimPassiveReply, mediaFileType, buildMediaMessageBody, buildMediaUploadBody,
   mediaChatlogLabel, needsPngConversion, sendMediaMessage, readLocalMediaForUpload,
-  MAX_FILE_DATA_BYTES, type QQConfig,
+  MAX_FILE_DATA_BYTES, parseAttachments, attachmentChatlogMarker,
+  sanitizeAttachmentFilename, downloadAttachment, handleDispatchAsync,
+  parseEventRow, type QQConfig,
 } from "../src/qq-bot.ts";
 import { writeFileSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -325,5 +328,152 @@ describe("media (v0.2.0)", () => {
     assert.strictEqual(out.converted, true);
     assert.strictEqual(out.fileName, "a.png");
     assert.strictEqual(readFileSync(join(dir, "a.png")).subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  });
+});
+
+describe("inbound attachments (v0.3.0)", () => {
+  test("parseAttachments keeps only known fields, tolerates missing/odd input", () => {
+    assert.deepStrictEqual(parseAttachments(undefined), []);
+    assert.deepStrictEqual(parseAttachments(null), []);
+    assert.deepStrictEqual(parseAttachments({ url: "x" }), []);
+    assert.deepStrictEqual(parseAttachments([]), []);
+    const atts = parseAttachments([
+      { content_type: "image/png", filename: "a.png", height: 100, width: 200, size: 1234, url: "https://cdn.example/a.png", extra: "dropped" },
+      { content_type: "image/jpeg", url: "https://cdn.example/b.jpg" },
+      "not-an-object",
+      42,
+      { filename: "no-url.png" },
+      {},
+      { content_type: "video/mp4", filename: "v.mp4", size: "999", url: "https://cdn.example/v.mp4" },
+    ]);
+    assert.strictEqual(atts.length, 4);
+    assert.deepStrictEqual(atts[0], { content_type: "image/png", filename: "a.png", height: 100, width: 200, size: 1234, url: "https://cdn.example/a.png" });
+    assert.deepStrictEqual(atts[1], { content_type: "image/jpeg", url: "https://cdn.example/b.jpg" });
+    assert.deepStrictEqual(atts[2], { filename: "no-url.png" });
+    assert.strictEqual(atts[3].size, 999); // numeric strings are coerced
+  });
+
+  test("attachmentChatlogMarker labels by content_type and prefers local_path", () => {
+    assert.strictEqual(attachmentChatlogMarker({ content_type: "image/png", url: "https://cdn.example/a.png", local_path: "/m/a.png" }), "[图片] /m/a.png");
+    assert.strictEqual(attachmentChatlogMarker({ content_type: "video/mp4", url: "https://cdn.example/v.mp4" }), "[视频] https://cdn.example/v.mp4");
+    assert.strictEqual(attachmentChatlogMarker({ content_type: "audio/mpeg", filename: "v.mp3" }), "[音频] v.mp3");
+    assert.strictEqual(attachmentChatlogMarker({ filename: "doc.pdf" }), "[附件] doc.pdf");
+  });
+
+  test("sanitizeAttachmentFilename strips paths and falls back to content_type", () => {
+    assert.strictEqual(sanitizeAttachmentFilename("../../evil.png"), "evil.png");
+    assert.strictEqual(sanitizeAttachmentFilename("my photo (1).png"), "my_photo_1_.png");
+    assert.strictEqual(sanitizeAttachmentFilename(undefined, "image/jpeg"), "file.jpeg");
+    assert.strictEqual(sanitizeAttachmentFilename("", "image/png"), "file.png");
+    assert.strictEqual(sanitizeAttachmentFilename("pic", undefined), "pic");
+  });
+
+  test("busy_timeout is set so readers wait out a writer's lock", () => {
+    const row = store.db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+    assert.strictEqual(row.timeout, 5000);
+  });
+
+  test("old databases gain the attachments column without losing rows", () => {
+    const oldPath = join(dir, "old.db");
+    const old = new DatabaseSync(oldPath);
+    old.exec(`CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE, kind TEXT, from_openid TEXT, target_openid TEXT, content TEXT, author_name TEXT, received_at INTEGER, msg_seq_next INTEGER DEFAULT 1, status TEXT DEFAULT 'pending', lease_until INTEGER, reply_count INTEGER DEFAULT 0);`);
+    old.prepare("INSERT INTO events(event_id,kind,from_openid,target_openid,content,author_name,received_at) VALUES(?,?,?,?,?,?,?)")
+      .run("old-1", "c2c", "u1", "u1", "hi", "alice", Date.now());
+    old.close();
+    const migrated = new Store(oldPath);
+    try {
+      const ev = migrated.getEvent("old-1")!;
+      assert.strictEqual(ev.content, "hi");
+      assert.deepStrictEqual(ev.attachments, []);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  test("insertEvent stores attachments; chatlog marks images, text-only unchanged", () => {
+    const ev = fakeC2C("m1", "", Date.now());
+    assert.strictEqual(store.insertEvent({ ...ev, attachments: [{ content_type: "image/png", url: "https://cdn.example/a.png", local_path: "/m/m1-0-a.png" }] }), true);
+    const got = store.getEvent("m1")!;
+    assert.deepStrictEqual(got.attachments, [{ content_type: "image/png", url: "https://cdn.example/a.png", local_path: "/m/m1-0-a.png" }]);
+    const rows = store.chatlogRows({ limit: 10 });
+    assert.strictEqual(rows[0].content, "[图片] /m/m1-0-a.png");
+
+    const ev2 = fakeC2C("m2", "hello", Date.now());
+    assert.strictEqual(store.insertEvent(ev2), true);
+    assert.deepStrictEqual(store.getEvent("m2")!.attachments, []);
+    const rows2 = store.chatlogRows({ limit: 10 });
+    assert.strictEqual(rows2.find((r: any) => r.content === "hello")?.content, "hello");
+  });
+
+  test("handleDispatch parses attachments for C2C and group", () => {
+    const d = {
+      id: "d1", author: { user_openid: "u1", username: "a" }, content: "",
+      timestamp: new Date().toISOString(),
+      attachments: [{ content_type: "image/png", filename: "a.png", url: "https://cdn.example/a.png" }],
+    };
+    assert.strictEqual(handleDispatch(store, "C2C_MESSAGE_CREATE", d), true);
+    const ev = store.getEvent("d1")!;
+    assert.strictEqual(ev.attachments?.length, 1);
+    assert.strictEqual(ev.attachments?.[0].url, "https://cdn.example/a.png");
+    assert.strictEqual(ev.attachments?.[0].local_path, undefined); // sync path does not download
+    const rows = store.chatlogRows({ limit: 10 });
+    assert.strictEqual(rows[0].content, "[图片] https://cdn.example/a.png");
+  });
+
+  test("downloadAttachment fetches to media dir; failure returns null", async () => {
+    const { createServer } = await import("node:http");
+    const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300000002000100e90d0a0a0000000049454e44ae426082", "hex");
+    const server = createServer((_req, res) => {
+      if (_req.url === "/ok.png") { res.writeHead(200, { "content-type": "image/png" }); res.end(png); }
+      else { res.writeHead(404); res.end(); }
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as any).port;
+    try {
+      const mediaDir = join(dir, "media");
+      const p = await downloadAttachment(mediaDir, "evt1", 0, { content_type: "image/png", filename: "a.png", url: `http://127.0.0.1:${port}/ok.png` });
+      assert.ok(p && p.endsWith("evt1-0-a.png"));
+      assert.deepStrictEqual(readFileSync(p!), png);
+      assert.strictEqual(await downloadAttachment(mediaDir, "evt1", 1, { url: `http://127.0.0.1:${port}/nope.png` }), null);
+      assert.strictEqual(await downloadAttachment(mediaDir, "evt1", 2, { url: "not-a-url" }), null);
+      assert.strictEqual(await downloadAttachment(mediaDir, "evt1", 3, { url: "http://127.0.0.1:1/x.png" }), null);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("handleDispatchAsync downloads then queues with local_path; failure still queues", async () => {
+    const { createServer } = await import("node:http");
+    const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300000002000100e90d0a0a0000000049454e44ae426082", "hex");
+    const server = createServer((_req, res) => { res.writeHead(200, { "content-type": "image/png" }); res.end(png); });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as any).port;
+    const cfg = { ...CFG, media_dir: join(dir, "media") };
+    try {
+      const d = {
+        id: "d1", author: { user_openid: "u1", username: "a" }, content: "这张",
+        timestamp: new Date().toISOString(),
+        attachments: [{ content_type: "image/png", filename: "a.png", url: `http://127.0.0.1:${port}/a.png` }],
+      };
+      assert.strictEqual(await handleDispatchAsync(store, cfg, "C2C_MESSAGE_CREATE", d), true);
+      const ev = store.getEvent("d1")!;
+      assert.ok(ev.attachments?.[0].local_path?.endsWith("d1-0-a.png"));
+      assert.deepStrictEqual(readFileSync(ev.attachments![0].local_path!), png);
+      const rows = store.chatlogRows({ limit: 10 });
+      assert.ok(rows[0].content.startsWith("这张 [图片] "));
+      assert.ok(rows[0].content.endsWith("d1-0-a.png"));
+
+      const d2 = {
+        id: "d2", author: { user_openid: "u1" }, content: "",
+        timestamp: new Date().toISOString(),
+        attachments: [{ content_type: "image/png", url: "http://127.0.0.1:1/gone.png" }],
+      };
+      assert.strictEqual(await handleDispatchAsync(store, cfg, "C2C_MESSAGE_CREATE", d2), true);
+      const ev2 = store.getEvent("d2")!;
+      assert.strictEqual(ev2.attachments?.[0].local_path, undefined);
+      assert.strictEqual(ev2.attachments?.[0].url, "http://127.0.0.1:1/gone.png");
+    } finally {
+      server.close();
+    }
   });
 });

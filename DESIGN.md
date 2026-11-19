@@ -3,9 +3,12 @@
 Status: **implemented 2026-11-19 (qq-bot v0.1.0), ported Bun → Node 24
 the same day, and verified end-to-end the same day against real QQ
 credentials in sandbox mode**: token + gateway + READY, and two C2C
-private-chat rounds ("你好" / "收到") replied and acked. Bridge code:
+private-chat rounds ("你好" / "收到") replied and acked. v0.2.0 added
+outbound media (msg_type 7, verified live 2026-11-19 with a 鱼香肉丝
+image sent to QQ). v0.3.0 adds inbound attachments (downloaded to
+`state_dir/media/`, 38 tests pass). Bridge code:
 `src/qq-bot.ts` (single file, Node 24, zero deps), tests in
-`tests/qq-bot.test.ts` (19 pass under `node --test`), installed wrapper
+`tests/qq-bot.test.ts` (38 pass under `node --test`), installed wrapper
 `~/.local/bin/qq-bot` (sh wrapper that execs `node src/qq-bot.ts` —
 Node type-stripping needs the `.ts` extension, so an extensionless copy
 does not work), config `~/.config/qq-bot/config.json` (0600), env
@@ -193,6 +196,19 @@ Notes:
   group admin enables "bot can get all group messages" in the group.
   Default is @-only. Treat non-@ group messages as context, not tasks
   (same as Reshwell/onebot-agent-bridge).
+- Attachments (v0.3.0, inbound): each entry in `d.attachments` follows
+  @tencent-connect/openclaw-qqbot `MessageAttachment`:
+  `{content_type: "image/png", filename?, height?, width?, size?, url}`
+  (voice additionally has `voice_wav_url` / `asr_refer_text`, not stored).
+  The `url` is a QQ CDN link — treat it as short-lived: the daemon
+  downloads it immediately to `state_dir/media/` as
+  `<event_id>-<index>-<filename>` (max 20 MB per file, 30 s timeout)
+  and stores `local_path` alongside the original fields in the
+  `events.attachments` JSON column. A failed download never blocks
+  queueing (logged, original URL kept). `inbox pull` returns the
+  attachments with `local_path`; chatlog marks them `[图片] <本地路径>`.
+  Old databases are migrated on open (ALTER TABLE adds the column;
+  existing rows keep working, `attachments` defaults to `[]`).
 - `AT_MESSAGE_CREATE` / `DIRECT_MESSAGE_CREATE` are guild channel
   events — out of scope for v1.
 - IDs are **openids, bot-specific**: they are not QQ numbers / group
