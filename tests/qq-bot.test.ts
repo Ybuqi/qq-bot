@@ -6,8 +6,13 @@ import { join } from "node:path";
 import {
   Store, parseDuration, parseExpiresIn, tokenIsFresh,
   passiveWindowMs, passiveExpired, stripAtMention, normalizeTimestamp,
-  INTENT_LEVELS, nextIntentLevel, handleDispatch, parseFlags, splitGlobalArgs, type QQConfig,
+  INTENT_LEVELS, nextIntentLevel, handleDispatch, parseFlags, splitGlobalArgs,
+  claimPassiveReply, mediaFileType, buildMediaMessageBody, buildMediaUploadBody,
+  mediaChatlogLabel, needsPngConversion, sendMediaMessage, readLocalMediaForUpload,
+  MAX_FILE_DATA_BYTES, type QQConfig,
 } from "../src/qq-bot.ts";
+import { writeFileSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
 const CFG: QQConfig = {
   chatlog_days: 30, state_dir: "~/.local/state/qq-bot", media_dir: "",
@@ -181,5 +186,144 @@ describe("text helpers", () => {
     assert.strictEqual(normalizeTimestamp("2026-11-19T09:00:00Z"), Date.parse("2026-11-19T09:00:00Z"));
     assert.strictEqual(normalizeTimestamp(1790000000), 1790000000 * 1000);
     assert.strictEqual(normalizeTimestamp(1790000000000), 1790000000000);
+  });
+});
+
+describe("media (v0.2.0)", () => {
+  test("mediaFileType maps image/video/audio/file to 1/2/3/4, unknown throws", () => {
+    assert.strictEqual(mediaFileType("image"), 1);
+    assert.strictEqual(mediaFileType("video"), 2);
+    assert.strictEqual(mediaFileType("audio"), 3);
+    assert.strictEqual(mediaFileType("file"), 4);
+    assert.throws(() => mediaFileType("sticker" as any), /unknown media type/);
+  });
+
+  test("buildMediaMessageBody: msg_type 7 + media.file_info; passive adds msg_id/msg_seq", () => {
+    assert.deepStrictEqual(buildMediaMessageBody("fi-abc"), { msg_type: 7, media: { file_info: "fi-abc" } });
+    assert.deepStrictEqual(buildMediaMessageBody("fi-abc", "d1", 2), { msg_type: 7, media: { file_info: "fi-abc" }, msg_id: "d1", msg_seq: 2 });
+    // msg_type 7 carries no text content.
+    assert.strictEqual("content" in buildMediaMessageBody("fi-abc", "d1", 1), false);
+  });
+
+  test("buildMediaUploadBody: url mode vs file_data mode, exactly one source", () => {
+    assert.deepStrictEqual(
+      buildMediaUploadBody("image", { url: "https://example.com/a.png" }),
+      { file_type: 1, srv_send_msg: false, url: "https://example.com/a.png" });
+    assert.deepStrictEqual(
+      buildMediaUploadBody("video", { fileData: "aGVsbG8=" }),
+      { file_type: 2, srv_send_msg: false, file_data: "aGVsbG8=" });
+    assert.throws(() => buildMediaUploadBody("image", {}), /exactly one of/);
+    assert.throws(() => buildMediaUploadBody("image", { url: "https://x", fileData: "eA==" }), /exactly one of/);
+  });
+
+  test("needsPngConversion: webp only (case-insensitive)", () => {
+    assert.strictEqual(needsPngConversion("a.webp"), true);
+    assert.strictEqual(needsPngConversion("a.WEBP"), true);
+    assert.strictEqual(needsPngConversion("a.png"), false);
+    assert.strictEqual(needsPngConversion("a.jpg"), false);
+    assert.strictEqual(needsPngConversion("a.mp4"), false);
+  });
+
+  test("mediaChatlogLabel", () => {
+    assert.strictEqual(mediaChatlogLabel("image", "https://example.com/a.png"), "[图片] https://example.com/a.png");
+    assert.strictEqual(mediaChatlogLabel("video", "https://example.com/b.mp4"), "[视频] https://example.com/b.mp4");
+    assert.strictEqual(mediaChatlogLabel("file", "doc.pdf"), "[文件] doc.pdf");
+  });
+
+  test("claimPassiveReply: unknown / kind mismatch / target mismatch", () => {
+    const noEvent = claimPassiveReply(store, "c2c", "user-1", "missing");
+    assert.strictEqual(noEvent.ok, false);
+    if (!noEvent.ok) assert.match(noEvent.message, /unknown msg-id/);
+    store.insertEvent(fakeC2C("m1"));
+    const kindMismatch = claimPassiveReply(store, "group", "user-1", "m1");
+    assert.strictEqual(kindMismatch.ok, false);
+    if (!kindMismatch.ok) assert.match(kindMismatch.message, /kind mismatch/);
+    const targetMismatch = claimPassiveReply(store, "c2c", "someone-else", "m1");
+    assert.strictEqual(targetMismatch.ok, false);
+    if (!targetMismatch.ok) assert.match(targetMismatch.message, /target mismatch/);
+  });
+
+  test("claimPassiveReply: expired window refused, quota of 5 refused, success takes seq", () => {
+    store.insertEvent(fakeC2C("old", "hi", Date.now() - 61 * 60_000));
+    const expired = claimPassiveReply(store, "c2c", "user-1", "old");
+    assert.strictEqual(expired.ok, false);
+    if (!expired.ok) assert.match(expired.message, /expired: passive window \(60 min\)/);
+
+    store.insertEvent(fakeC2C("m1"));
+    for (let i = 0; i < 5; i++) store.takeMsgSeq("m1");
+    const quota = claimPassiveReply(store, "c2c", "user-1", "m1");
+    assert.strictEqual(quota.ok, false);
+    if (!quota.ok) assert.match(quota.message, /already 5 passive replies/);
+
+    store.insertEvent(fakeC2C("m2"));
+    const ok = claimPassiveReply(store, "c2c", "user-1", "m2");
+    assert.strictEqual(ok.ok, true);
+    if (ok.ok) {
+      assert.strictEqual(ok.seq, 1);
+      assert.strictEqual(ok.requestId, "reply-m2-1");
+      assert.strictEqual(store.getEvent("m2")!.msg_seq_next, 2);
+      assert.strictEqual(store.getEvent("m2")!.reply_count, 1);
+    }
+  });
+
+  test("sendMediaMessage: refuses active send without msg-id, and failed send rolls back msg_seq", async () => {
+    const savedId = process.env.QQ_APP_ID;
+    const savedSecret = process.env.QQ_APP_SECRET;
+    delete process.env.QQ_APP_ID;
+    delete process.env.QQ_APP_SECRET;
+    try {
+      const active = await sendMediaMessage({
+        store, config: CFG, kind: "c2c", to: "user-1",
+        fileInfo: "fi-1", mediaType: "image", ref: "https://example.com/a.png",
+      });
+      assert.strictEqual(active.ok, false);
+      assert.match(active.message ?? "", /refusing active send/);
+
+      // No credentials in this process: the token fetch throws, the
+      // send fails, and the claimed msg_seq must be rolled back.
+      store.insertEvent(fakeC2C("m1"));
+      const failed = await sendMediaMessage({
+        store, config: CFG, kind: "c2c", to: "user-1", msgId: "m1",
+        fileInfo: "fi-1", mediaType: "image", ref: "https://example.com/a.png",
+      });
+      assert.strictEqual(failed.ok, false);
+      assert.strictEqual(store.getEvent("m1")!.msg_seq_next, 1);
+      assert.strictEqual(store.getEvent("m1")!.reply_count, 0);
+    } finally {
+      if (savedId !== undefined) process.env.QQ_APP_ID = savedId;
+      if (savedSecret !== undefined) process.env.QQ_APP_SECRET = savedSecret;
+    }
+  });
+
+  test("readLocalMediaForUpload: small png passes through; oversize file tells the user to use --url", () => {
+    // Minimal 1x1 PNG.
+    const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300000002000100e90d0a0a0000000049454e44ae426082", "hex");
+    const pngPath = join(dir, "a.png");
+    writeFileSync(pngPath, png);
+    const ok = readLocalMediaForUpload(pngPath, "image");
+    assert.strictEqual(ok.converted, false);
+    assert.strictEqual(ok.fileName, "a.png");
+    assert.strictEqual(ok.fileData, png.toString("base64"));
+
+    const bigPath = join(dir, "big.mp4");
+    writeFileSync(bigPath, Buffer.alloc(MAX_FILE_DATA_BYTES + 1));
+    assert.throws(() => readLocalMediaForUpload(bigPath, "video"), /over the 5 MB file_data limit.*--url/);
+  });
+
+  test("readLocalMediaForUpload: webp image is converted to png first", () => {
+    // Generate a tiny webp with Pillow; skip the conversion assertion
+    // (but not the test) when Pillow is unavailable.
+    let webpPath = join(dir, "a.webp");
+    try {
+      execFileSync("python3", ["-c",
+        "from PIL import Image; Image.new('RGB', (2, 2), (255, 0, 0)).save('PLACEHOLDER', 'WEBP')".replace("PLACEHOLDER", webpPath)],
+        { stdio: "pipe" });
+    } catch {
+      return; // Pillow missing: webp detection is covered by needsPngConversion.
+    }
+    const out = readLocalMediaForUpload(webpPath, "image");
+    assert.strictEqual(out.converted, true);
+    assert.strictEqual(out.fileName, "a.png");
+    assert.strictEqual(readFileSync(join(dir, "a.png")).subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
   });
 });

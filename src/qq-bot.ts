@@ -19,10 +19,11 @@
  */
 import { DatabaseSync } from "node:sqlite";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, extname } from "node:path";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 /* ------------------------------------------------------------------ */
 /* Paths / config / env                                                */
@@ -383,6 +384,48 @@ export function passiveExpired(ev: QQEvent): boolean {
   return Date.now() - ev.received_at > passiveWindowMs(ev.kind);
 }
 
+/** Claim a passive reply slot for an inbound event: validates the
+ *  event, checks the passive window + 5-reply quota, and takes the
+ *  next msg_seq. Callers must roll back with store.rollbackMsgSeq()
+ *  if the send itself fails. */
+export function claimPassiveReply(store: Store, kind: "c2c" | "group", to: string, msgId: string):
+  { ok: true; event: QQEvent; seq: number; requestId: string } | { ok: false; message: string } {
+  const event = store.getEvent(msgId);
+  if (!event) return { ok: false, message: `unknown msg-id: ${msgId} (no such event in inbox; passive reply needs the inbound d.id)` };
+  if (event.kind !== kind) return { ok: false, message: `msg-id kind mismatch: event is ${event.kind}, send kind is ${kind}` };
+  if (event.target_openid !== to) return { ok: false, message: `msg-id target mismatch: event target is ${event.target_openid}` };
+  if (passiveExpired(event)) {
+    return { ok: false, message: `expired: passive window (${kind === "group" ? "5 min" : "60 min"}) for msg ${msgId} has passed; refusing instead of falling back to an active send` };
+  }
+  if (event.reply_count >= 5) return { ok: false, message: `quota: already 5 passive replies for msg ${msgId}` };
+  const seq = store.takeMsgSeq(msgId);
+  if (seq === null) return { ok: false, message: `unknown msg-id: ${msgId}` };
+  return { ok: true, event, seq, requestId: `reply-${msgId}-${seq}` };
+}
+
+/** POST to the QQ OpenAPI with a fresh token; on 401 / 11243 (token
+ *  invalid) refresh once and retry. Returns raw HTTP status + parsed
+ *  JSON body ({} when the body is not JSON). */
+export async function apiPost(store: Store, config: QQConfig, path: string, body: any): Promise<{ status: number; body: any }> {
+  const { appId } = getCredentials();
+  const base = apiBase(config.sandbox);
+  const doPost = async (token: string): Promise<{ status: number; body: any }> => {
+    const res = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { Authorization: `QQBot ${token}`, "Content-Type": "application/json", "X-Union-Appid": appId },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json().catch(() => ({})) };
+  };
+  let token = await getAccessToken(store);
+  let r = await doPost(token);
+  if (r.status === 401 || r.body?.code === 11243) {
+    token = await getAccessToken(store, true);
+    r = await doPost(token);
+  }
+  return r;
+}
+
 export async function sendMessage(opts: {
   store: Store; config: QQConfig; kind: "c2c" | "group";
   to: string; text: string; msgId?: string; active?: boolean;
@@ -394,33 +437,14 @@ export async function sendMessage(opts: {
   let seq: number | null = null;
   let requestId = `active-${to}-${Date.now()}`;
   if (opts.msgId) {
-    event = store.getEvent(opts.msgId);
-    if (!event) return { ok: false, message: `unknown msg-id: ${opts.msgId} (no such event in inbox; passive reply needs the inbound d.id)` };
-    if (event.kind !== kind) return { ok: false, message: `msg-id kind mismatch: event is ${event.kind}, send kind is ${kind}` };
-    if (event.target_openid !== to) return { ok: false, message: `msg-id target mismatch: event target is ${event.target_openid}` };
-    if (passiveExpired(event)) {
-      return { ok: false, message: `expired: passive window (${kind === "group" ? "5 min" : "60 min"}) for msg ${opts.msgId} has passed; refusing instead of falling back to an active send` };
-    }
-    if (event.reply_count >= 5) return { ok: false, message: `quota: already 5 passive replies for msg ${opts.msgId}` };
-    seq = store.takeMsgSeq(opts.msgId);
-    if (seq === null) return { ok: false, message: `unknown msg-id: ${opts.msgId}` };
-    requestId = `reply-${opts.msgId}-${seq}`;
+    const claimed = claimPassiveReply(store, kind, to, opts.msgId);
+    if (!claimed.ok) return { ok: false, message: claimed.message };
+    event = claimed.event; seq = claimed.seq; requestId = claimed.requestId;
   } else if (!opts.active) {
     return { ok: false, message: "refusing active send: pass --msg-id for a passive reply, or --active explicitly (active quota is 4/month)" };
   }
 
-  const { appId } = getCredentials();
-  const base = apiBase(config.sandbox);
   const path = kind === "c2c" ? `/v2/users/${encodeURIComponent(to)}/messages` : `/v2/groups/${encodeURIComponent(to)}/messages`;
-
-  const doPost = async (token: string, body: any): Promise<any> => {
-    const res = await fetch(`${base}${path}`, {
-      method: "POST",
-      headers: { Authorization: `QQBot ${token}`, "Content-Type": "application/json", "X-Union-Appid": appId },
-      body: JSON.stringify(body),
-    });
-    return { status: res.status, body: await res.json().catch(() => ({})) };
-  };
 
   let body: any = { content: text, msg_type: 0 };
   if (opts.msgId) { body.msg_id = opts.msgId; body.msg_seq = seq; }
@@ -432,13 +456,7 @@ export async function sendMessage(opts: {
   };
 
   try {
-    let token = await getAccessToken(store);
-    let r = await doPost(token, body);
-    // 401 / 11243: token invalid — refresh once and retry.
-    if (r.status === 401 || r.body?.code === 11243) {
-      token = await getAccessToken(store, true);
-      r = await doPost(token, body);
-    }
+    let r = await apiPost(store, config, path, body);
     if (!r.body || typeof r.body !== "object") {
       return failWith(`send failed: non-JSON response (HTTP ${r.status})`);
     }
@@ -449,7 +467,7 @@ export async function sendMessage(opts: {
       const msg = String(r.body.message ?? "");
       if (kind === "group" && opts.msgId && /msg_seq/i.test(msg)) {
         const { msg_seq, ...noSeq } = body;
-        r = await doPost(token, noSeq);
+        r = await apiPost(store, config, path, noSeq);
         if (r.body?.code) return failWith(`send failed: code=${r.body.code} message=${r.body.message ?? ""}`);
       } else if (code === 11298 || code === 40023002) {
         return failWith(`IP whitelist (code ${code}): this machine's egress IP is not whitelisted on q.qq.com; switch to sandbox for C2C testing`);
@@ -461,6 +479,182 @@ export async function sendMessage(opts: {
     const fromOpenid = event ? event.from_openid : to;
     store.recordSend(requestId, opts.msgId ?? "", to, text, JSON.stringify(r.body ?? {}));
     store.appendBotChatlog(kind, to, fromOpenid, text);
+    return { ok: true, raw: r.body };
+  } catch (err: any) {
+    return failWith(err?.message ?? String(err));
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* QQ API: rich media (v0.2.0) — upload + msg_type 7 send              */
+/* ------------------------------------------------------------------ */
+
+export type MediaKind = "image" | "video" | "audio" | "file";
+export const MEDIA_FILE_TYPES: Record<MediaKind, number> = { image: 1, video: 2, audio: 3, file: 4 };
+export const MEDIA_TYPE_LABELS: Record<MediaKind, string> = { image: "图片", video: "视频", audio: "音频", file: "文件" };
+/** Max size for the file_data (base64) upload path. Larger files must go via a public URL. */
+export const MAX_FILE_DATA_BYTES = 5 * 1024 * 1024;
+
+export function mediaFileType(kind: MediaKind): number {
+  const t = (MEDIA_FILE_TYPES as Record<string, number>)[kind];
+  if (t === undefined) throw new Error(`unknown media type: ${kind} (expected image|video|audio|file)`);
+  return t;
+}
+
+/** msg_type 7 body. msg_type 7 cannot carry a text `content` — send any
+ *  caption as a separate text message. */
+export function buildMediaMessageBody(fileInfo: string, msgId?: string, seq?: number | null): any {
+  const body: any = { msg_type: 7, media: { file_info: fileInfo } };
+  if (msgId) { body.msg_id = msgId; if (seq != null) body.msg_seq = seq; }
+  return body;
+}
+
+/** Upload body: exactly one of url / file_data, plus srv_send_msg=false
+ *  (upload only; the message is sent separately with msg_type 7). */
+export function buildMediaUploadBody(mediaType: MediaKind, opts: { url?: string; fileData?: string }): any {
+  if (!opts.url && !opts.fileData) throw new Error("upload needs exactly one of --url or --file");
+  if (opts.url && opts.fileData) throw new Error("upload needs exactly one of --url or --file, not both");
+  const body: any = { file_type: mediaFileType(mediaType), srv_send_msg: false };
+  if (opts.url) body.url = opts.url;
+  else body.file_data = opts.fileData;
+  return body;
+}
+
+export function mediaChatlogLabel(mediaType: MediaKind, ref: string): string {
+  return `[${MEDIA_TYPE_LABELS[mediaType]}] ${ref}`;
+}
+
+/** QQ's image whitelist is png/jpg/jpeg/gif; webp must be converted to png first. */
+export function needsPngConversion(fileName: string): boolean {
+  return extname(fileName).toLowerCase() === ".webp";
+}
+
+/** webp -> png via python3+Pillow (white background for transparency),
+ *  ffmpeg as fallback. Throws when neither is available. */
+export function convertWebpToPng(inputPath: string, outputPath: string): void {
+  try {
+    execFileSync("python3", ["-c",
+      "import sys\nfrom PIL import Image\nim = Image.open(sys.argv[1]).convert('RGBA')\nbg = Image.new('RGBA', im.size, (255, 255, 255, 255))\nImage.alpha_composite(bg, im).convert('RGB').save(sys.argv[2], 'PNG')",
+      inputPath, outputPath], { stdio: "pipe" });
+    return;
+  } catch { /* fall through to ffmpeg */ }
+  try {
+    execFileSync("ffmpeg", ["-y", "-i", inputPath, outputPath], { stdio: "pipe" });
+  } catch {
+    throw new Error("webp -> png conversion failed: need python3+Pillow or ffmpeg");
+  }
+}
+
+export interface LocalMedia { fileData: string; fileName: string; converted: boolean; sizeBytes: number }
+
+/** Read a local file for the file_data upload path. Images in webp are
+ *  converted to png first. Files over 5 MB cannot use file_data — the
+ *  caller must upload to a public URL and use --url instead. */
+export function readLocalMediaForUpload(filePath: string, mediaType: MediaKind): LocalMedia {
+  const data = readFileSync(filePath);
+  let buf = data;
+  let fileName = filePath.split("/").pop() ?? filePath;
+  let converted = false;
+  if (mediaType === "image" && needsPngConversion(fileName)) {
+    const outPath = filePath.replace(/\.webp$/i, ".png");
+    convertWebpToPng(filePath, outPath);
+    buf = readFileSync(outPath);
+    fileName = outPath.split("/").pop() ?? fileName;
+    converted = true;
+  }
+  if (buf.length > MAX_FILE_DATA_BYTES) {
+    throw new Error(`file is ${(buf.length / 1048576).toFixed(1)} MB, over the 5 MB file_data limit — upload it to a public URL first and use --url instead`);
+  }
+  return { fileData: buf.toString("base64"), fileName, converted, sizeBytes: buf.length };
+}
+
+export interface UploadMediaResult { ok: boolean; fileInfo?: string; fileUuid?: string; ttl?: number; message?: string; raw?: any }
+
+/** Upload a media file to the QQ platform (upload only, no message is
+ *  sent). Prefer the url mode — QQ downloads the file itself. The
+ *  returned file_info is then sent with sendMediaMessage (msg_type 7). */
+export async function uploadMediaFile(opts: {
+  store: Store; config: QQConfig; kind: "c2c" | "group"; to: string;
+  mediaType: MediaKind; url?: string; fileData?: string;
+}): Promise<UploadMediaResult> {
+  const { store, config, kind, to, mediaType } = opts;
+  let body: any;
+  try {
+    body = buildMediaUploadBody(mediaType, opts);
+  } catch (err: any) {
+    return { ok: false, message: err?.message ?? String(err) };
+  }
+  const path = kind === "c2c" ? `/v2/users/${encodeURIComponent(to)}/files` : `/v2/groups/${encodeURIComponent(to)}/files`;
+  try {
+    const r = await apiPost(store, config, path, body);
+    if (!r.body || typeof r.body !== "object") return { ok: false, message: `upload failed: non-JSON response (HTTP ${r.status})` };
+    if (r.body.code) {
+      const code = r.body.code;
+      if (code === 11298 || code === 40023002) {
+        return { ok: false, message: `IP whitelist (code ${code}): this machine's egress IP is not whitelisted on q.qq.com; switch to sandbox for C2C testing` };
+      }
+      return { ok: false, message: `upload failed: code=${code} message=${r.body.message ?? ""} (status ${r.status})` };
+    }
+    const fileInfo = r.body.file_info;
+    if (!fileInfo) return { ok: false, message: `upload failed: no file_info in response (HTTP ${r.status})` };
+    return { ok: true, fileInfo, fileUuid: r.body.file_uuid, ttl: r.body.ttl, raw: r.body };
+  } catch (err: any) {
+    return { ok: false, message: err?.message ?? String(err) };
+  }
+}
+
+/** Send an already-uploaded media file as a passive (or explicit
+ *  active) reply. Same window/quota/seq rules as sendMessage; the
+ *  chatlog records "[图片] <url>" etc. so context stays readable. */
+export async function sendMediaMessage(opts: {
+  store: Store; config: QQConfig; kind: "c2c" | "group";
+  to: string; msgId?: string; active?: boolean;
+  fileInfo: string; mediaType: MediaKind; ref: string;
+}): Promise<SendResult> {
+  const { store, config, kind, to } = opts;
+  if (!opts.fileInfo) return { ok: false, message: "empty file_info: upload the media first" };
+
+  let event: QQEvent | null = null;
+  let seq: number | null = null;
+  let requestId = `active-${to}-${Date.now()}`;
+  if (opts.msgId) {
+    const claimed = claimPassiveReply(store, kind, to, opts.msgId);
+    if (!claimed.ok) return { ok: false, message: claimed.message };
+    event = claimed.event; seq = claimed.seq; requestId = claimed.requestId;
+  } else if (!opts.active) {
+    return { ok: false, message: "refusing active send: pass --msg-id for a passive reply, or --active explicitly (active quota is 4/month)" };
+  }
+
+  const path = kind === "c2c" ? `/v2/users/${encodeURIComponent(to)}/messages` : `/v2/groups/${encodeURIComponent(to)}/messages`;
+  const body = buildMediaMessageBody(opts.fileInfo, opts.msgId, seq);
+  const label = mediaChatlogLabel(opts.mediaType, opts.ref);
+
+  // A failed send must not burn the msg_seq / reply-count for this msg_id.
+  const failWith = (message: string): SendResult => {
+    if (opts.msgId) store.rollbackMsgSeq(opts.msgId);
+    return { ok: false, message };
+  };
+
+  try {
+    let r = await apiPost(store, config, path, body);
+    if (!r.body || typeof r.body !== "object") return failWith(`send failed: non-JSON response (HTTP ${r.status})`);
+    if (r.body.code) {
+      const code = r.body.code;
+      const msg = String(r.body.message ?? "");
+      if (kind === "group" && opts.msgId && /msg_seq/i.test(msg)) {
+        const { msg_seq, ...noSeq } = body;
+        r = await apiPost(store, config, path, noSeq);
+        if (r.body?.code) return failWith(`send failed: code=${r.body.code} message=${r.body.message ?? ""}`);
+      } else if (code === 11298 || code === 40023002) {
+        return failWith(`IP whitelist (code ${code}): this machine's egress IP is not whitelisted on q.qq.com; switch to sandbox for C2C testing`);
+      } else {
+        return failWith(`send failed: code=${code} message=${msg} (status ${r.status})`);
+      }
+    }
+
+    const fromOpenid = event ? event.from_openid : to;
+    store.recordSend(requestId, opts.msgId ?? "", to, label, JSON.stringify(r.body ?? {}));
+    store.appendBotChatlog(kind, to, fromOpenid, label);
     return { ok: true, raw: r.body };
   } catch (err: any) {
     return failWith(err?.message ?? String(err));
@@ -712,7 +906,9 @@ Usage:
 
 Commands:
   run               Connect to the QQ gateway, queue messages (daemon)
-  send              Send a message (see qq-bot send -h)
+  send              Send a text message (see qq-bot send -h)
+  send-media        Upload + send an image/video/audio/file (msg_type 7)
+  upload-media      Upload media only, print file_info (for testing)
   inbox             Claim / ack pull events, or requeue (see qq-bot inbox -h)
   chatlog           Query recorded chats (see qq-bot chatlog -h)
   status            Show binding / gateway / inbox state
@@ -723,8 +919,9 @@ Flags:
   -config string    path to config.json (default ~/.config/qq-bot/config.json)
   --json            machine-readable output (status / inbox / chatlog)
 
-Replies are plain text only. Passive replies only by default; an active
-send needs --active and burns the 4/month quota.
+Replies are text (msg_type 0) or media (msg_type 7, no caption — send
+any caption as a separate text message). Passive replies only by
+default; an active send needs --active and burns the 4/month quota.
 `;
 }
 
@@ -903,6 +1100,77 @@ async function main() {
     });
     if (!result.ok) fail(result.message ?? "send failed");
     console.log(JSON.stringify({ ok: true, request: result.raw ?? {} }, null, 2));
+    return;
+  }
+
+  if (cmd === "send-media") {
+    const { flags: mf } = parseFlags(args);
+    const to = mf.to as string | undefined;
+    const kind = (mf.kind as string | undefined) ?? "c2c";
+    const type = mf.type as string | undefined;
+    const url = mf.url as string | undefined;
+    const file = mf.file as string | undefined;
+    if (!to) fail("usage: qq-bot send-media --to <openid> --kind c2c|group --msg-id <d.id> --type image|video|audio|file (--url <公网URL> | --file <本地路径>)");
+    if (kind !== "c2c" && kind !== "group") fail("--kind must be c2c or group");
+    if (!type || !["image", "video", "audio", "file"].includes(type)) fail("--type must be image|video|audio|file");
+    if (!url && !file) fail("send-media needs --url <公网URL> or --file <本地路径>");
+    if (url && file) fail("send-media needs exactly one of --url or --file, not both");
+    const mediaType = type as MediaKind;
+    const msgId = typeof mf["msg-id"] === "string" ? (mf["msg-id"] as string) : undefined;
+    let fileInfo: string;
+    let ref = url ?? file!;
+    if (url) {
+      const up = await uploadMediaFile({ store, config, kind: kind as "c2c" | "group", to, mediaType, url });
+      if (!up.ok) fail(up.message ?? "upload failed");
+      fileInfo = up.fileInfo!;
+    } else {
+      let local: LocalMedia;
+      try {
+        local = readLocalMediaForUpload(file!, mediaType);
+      } catch (err: any) {
+        fail(err?.message ?? String(err));
+      }
+      ref = local!.fileName;
+      const up = await uploadMediaFile({ store, config, kind: kind as "c2c" | "group", to, mediaType, fileData: local!.fileData });
+      if (!up.ok) fail(`${up.message ?? "upload failed"} — try uploading to a public URL and use --url instead`);
+      fileInfo = up.fileInfo!;
+    }
+    const result = await sendMediaMessage({
+      store, config, kind: kind as "c2c" | "group", to, msgId,
+      active: Boolean(mf.active), fileInfo, mediaType, ref,
+    });
+    if (!result.ok) fail(result.message ?? "send-media failed");
+    console.log(JSON.stringify({ ok: true, request: result.raw ?? {} }, null, 2));
+    return;
+  }
+
+  if (cmd === "upload-media") {
+    const { flags: uf } = parseFlags(args);
+    const to = uf.to as string | undefined;
+    const kind = (uf.kind as string | undefined) ?? "c2c";
+    const type = uf.type as string | undefined;
+    const url = uf.url as string | undefined;
+    const file = uf.file as string | undefined;
+    if (!to) fail("usage: qq-bot upload-media --to <openid> --kind c2c|group --type image|video|audio|file (--url <公网URL> | --file <本地路径>)");
+    if (kind !== "c2c" && kind !== "group") fail("--kind must be c2c or group");
+    if (!type || !["image", "video", "audio", "file"].includes(type)) fail("--type must be image|video|audio|file");
+    if (!url && !file) fail("upload-media needs --url <公网URL> or --file <本地路径>");
+    if (url && file) fail("upload-media needs exactly one of --url or --file, not both");
+    const mediaType = type as MediaKind;
+    let up: UploadMediaResult;
+    if (url) {
+      up = await uploadMediaFile({ store, config, kind: kind as "c2c" | "group", to, mediaType, url });
+    } else {
+      let local: LocalMedia;
+      try {
+        local = readLocalMediaForUpload(file!, mediaType);
+      } catch (err: any) {
+        fail(err?.message ?? String(err));
+      }
+      up = await uploadMediaFile({ store, config, kind: kind as "c2c" | "group", to, mediaType, fileData: local!.fileData });
+    }
+    if (!up.ok) fail(up.message ?? "upload failed");
+    console.log(JSON.stringify({ ok: true, file_info: up.fileInfo, file_uuid: up.fileUuid ?? null, ttl: up.ttl ?? null }, null, 2));
     return;
   }
 

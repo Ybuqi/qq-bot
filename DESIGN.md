@@ -226,7 +226,16 @@ Header: `Authorization: QQBot <access_token>`.
 ```
 
 - `msg_type`: `0` text, `2` markdown, `3` ark, `4` embed, `7` media.
-  v1 sends plain text only (`msg_type: 0`), like wx-bot.
+  v0.1.0 只发纯文本（`msg_type: 0`）；**v0.2.0 已实现富媒体**：
+  先 `POST /v2/users/{openid}/files` 或 `/v2/groups/{group_openid}/files`
+  上传（`file_type` 1 图片 / 2 视频 / 3 音频 / 4 文件，
+  `srv_send_msg=false`），再用 `msg_type: 7` + `media.file_info` 发送。
+  上传两种模式：`url`（QQ 自己下载，适合 > 5 MB）或 `file_data`
+ （base64，≤ 5 MB）。实测（2026-11-19 沙箱）：`file_data` 图片、视频
+  均成功；`url` 用 Muse 内置存储链接两次失败（`850027 富媒体文件
+  上传超时`，连 1 KB 小图也超时），目前优先用 `file_data`。
+  webp 图片先转 png 再传。`msg_type: 7` 不能带 `content` 文本，
+  配文单独发一条文本消息。
 - Passive reply: include `msg_id` (= inbound `d.id`). `msg_seq` is a
   per-`msg_id` counter starting at 1, incremented for each extra reply
   to the same inbound message; the platform rejects a repeated
@@ -243,6 +252,8 @@ Header: `Authorization: QQBot <access_token>`.
   `POST /v2/users/{openid}/files` or `/v2/groups/{group_openid}/files`
   (`file_type` 1 image / 2 video / 3 audio / 4 file,
   `srv_send_msg=false`), then send with `msg_type: 7` + `media.file_info`.
+  **Implemented in v0.2.0 (2026-11-19), see README "直接发图片/视频" and
+  `uploadMediaFile` / `sendMediaMessage` in src/qq-bot.ts.**
 
 ### Limits (the design constraint)
 

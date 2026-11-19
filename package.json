@@ -7,5 +7,5 @@
     "start": "node src/qq-bot.ts run"
   },
   "type": "module",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

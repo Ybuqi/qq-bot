@@ -124,9 +124,42 @@ sleep 15
 1. 先 `qq-bot chatlog --binding muse --since 7d --limit 40` 看最近 40 条；
 2. 再 `qq-bot inbox pull --binding muse --lease 30m` 拉取；
 3. 只回白名单用户，纯文本回复，处理完每条都 ack；
-4. 生成了视频、文档等文件时：先上传到文件存储拿到下载链接，
-   把原始链接和过期时间写进 QQ 回复里，同时在主聊天交付文件。
-   机器人本身发不了附件，链接是交付方式（链接一般 48 小时有效）。
+4. 生成了图片、视频等文件时：优先用 `send-media` 直接发到 QQ
+   （见下面“直接发图片/视频”一节），配文单独发一条文本；
+   媒体发送失败再退回发下载链接，同时在主聊天交付文件。
+
+## 直接发图片/视频（v0.2.0）
+
+QQ 官方 Bot API 支持富媒体：先上传文件拿到 `file_info`，再用
+`msg_type: 7` 发送。被动回复规则和文本完全一样（私聊 60 分钟窗口、
+每条消息最多 5 次，配文不能和媒体同发，要单独发一条文本）。
+
+```bash
+# 只上传不发（测试用），拿到 file_info
+qq-bot upload-media --to <openid> --kind c2c --type image --url <公网URL>
+
+# 上传 + 作为被动回复发出去（--msg-id 是收到的那条 QQ 消息的 d.id）
+qq-bot send-media --to <openid> --kind c2c --msg-id <d.id> \
+  --type image --url <公网URL>
+qq-bot send-media --to <openid> --kind c2c --msg-id <d.id> \
+  --type video --file /path/to/video.mp4
+```
+
+`--type` 是 `image`（file_type 1）/ `video`（2）/ `audio`（3）/ `file`（4）。
+两种上传方式：
+
+- `--file <本地路径>`：文件以 base64（`file_data`）直接上传，≤ 5 MB。
+  图片是 webp 时会自动先转成 png（python3 + Pillow，ffmpeg 备用），
+  因为 QQ 图片白名单一般是 png/jpg/jpeg/gif。
+- `--url <公网URL>`：QQ 平台自己去下载，适合 > 5 MB 的文件。
+
+**实测结论（2026-11-19，沙箱）：`--file` 模式图片和视频都成功拿到了
+`file_info`；`--url` 模式用 Muse 内置存储（muse.ai）的链接两次都失败，
+报错 `850027 富媒体文件上传超时`，连 1 KB 的小图也超时，说明 QQ 服务器
+拉不到这类链接。所以目前优先用 `--file`；超过 5 MB 的视频先试 `--url`，
+失败就改发下载链接文本。**
+
+chatlog 里媒体记为 `[图片] <url或文件名>` / `[视频] …`，上下文里能看到。
 
 ## 常用命令
 
