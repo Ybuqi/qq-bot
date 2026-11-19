@@ -1,0 +1,11 @@
+{
+  "description": "QQ official Bot -> Muse (Dash) pull bridge. TypeScript on Node 24, zero external dependencies.",
+  "name": "qq-bot",
+  "scripts": {
+    "build": "sh scripts/install.sh",
+    "test": "node --test tests/qq-bot.test.ts",
+    "start": "node src/qq-bot.ts run"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}

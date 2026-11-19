@@ -1,0 +1,10 @@
+# Secrets and local state — never commit these
+.env
+config.json
+*.db
+*.db-shm
+*.db-wal
+run.json
+run.log
+node_modules/
+.DS_Store

@@ -1,0 +1,63 @@
+#!/bin/sh
+# qq-bot keepalive, mirroring wx-bot-keepalive.
+# Prints exactly one line: ok / restarted: <how> / NEED_USER: <reason>
+set -u
+QQBOT="${QQBOT:-$HOME/.local/bin/qq-bot}"
+ENVFILE="${HOME}/.config/qq-bot/env"
+LOG="${HOME}/.local/state/qq-bot/run.log"
+if [ -f "$ENVFILE" ]; then
+  set -a
+  . "$ENVFILE"
+  set +a
+fi
+if [ ! -x "$QQBOT" ]; then
+  echo "NEED_USER: qq-bot 程序不见了，需要重新安装（~/workspace/qq-bot-bridge/）"
+  exit 1
+fi
+live="$("$QQBOT" health --liveness 2>&1)"
+live_rc=$?
+how=""
+if [ "$live_rc" -ne 0 ]; then
+  case "$live" in
+  *"is not running"* | *stalled*) ;;
+  *)
+    echo "NEED_USER: qq-bot health 无法运行：$(printf '%s' "$live" | head -1)"
+    exit 1
+    ;;
+  esac
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 &&
+    systemctl --user cat qq-bot >/dev/null 2>&1 &&
+    systemctl --user restart qq-bot >/dev/null 2>&1; then
+    how="systemctl --user restart qq-bot"
+  elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 &&
+    systemctl cat qq-bot >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ] && systemctl restart qq-bot >/dev/null 2>&1; then
+      how="systemctl restart qq-bot"
+    elif sudo -n systemctl restart qq-bot >/dev/null 2>&1; then
+      how="sudo -n systemctl restart qq-bot"
+    fi
+  fi
+  if [ -z "$how" ]; then
+    pkill -f "qq-bot.* run$" 2>/dev/null
+    mkdir -p "$(dirname "$LOG")"
+    (
+      if command -v setsid >/dev/null 2>&1; then
+        setsid nohup "$QQBOT" run >>"$LOG" 2>&1 </dev/null &
+      else
+        nohup "$QQBOT" run >>"$LOG" 2>&1 </dev/null &
+      fi
+    )
+    how="nohup qq-bot run (log: ${LOG})"
+  fi
+  sleep 15
+  if ! "$QQBOT" health --liveness >/dev/null 2>&1; then
+    echo "NEED_USER: qq-bot 启动失败（${how}）：$("$QQBOT" health 2>&1 | head -1)"
+    exit 1
+  fi
+fi
+if out="$("$QQBOT" health 2>&1)"; then
+  if [ -n "$how" ]; then echo "restarted: $how"; else echo "ok"; fi
+else
+  echo "NEED_USER: $out"
+  exit 1
+fi

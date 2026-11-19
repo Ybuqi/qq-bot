@@ -1,0 +1,1 @@
+{"allow_from":["<你的 QQ 用户 openid>"],"binding":"muse","chatlog_days":30,"delivery":"pull","group_allow_from":[],"intents":1107296256,"media_dir":"~/.local/state/qq-bot/media","sandbox":true,"state_dir":"~/.local/state/qq-bot"}
